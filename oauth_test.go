@@ -1081,9 +1081,10 @@ func Test_requestParameters(t *testing.T) {
 
 func Test_authorizationHeaderParameters(t *testing.T) {
 	testCases := []struct {
-		name   string
-		header string
-		want   map[string]string
+		name      string
+		header    string
+		want      map[string]string
+		wantError bool
 	}{
 		{
 			"rfc example",
@@ -1095,6 +1096,7 @@ func Test_authorizationHeaderParameters(t *testing.T) {
 				"oauth_verifier":         "473f82d3",
 				"oauth_signature":        "ja893SD9&xyz4992k83j47x0b",
 			},
+			false,
 		},
 		{
 			"include all fields but realm",
@@ -1103,6 +1105,7 @@ func Test_authorizationHeaderParameters(t *testing.T) {
 				"foo":           "bar",
 				"oauth_version": "1.0",
 			},
+			false,
 		},
 		{
 			"case insensitive auth scheme identifier",
@@ -1110,34 +1113,38 @@ func Test_authorizationHeaderParameters(t *testing.T) {
 			map[string]string{
 				"foo": "bar",
 			},
+			false,
 		},
 		{
-			"bad type",
+			"wrong auth type",
 			`Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==`,
 			nil,
+			false,
 		},
 		{
 			"missing quotation marks",
 			`OAuth realm="Example", oauth_version=1.0`,
 			nil,
+			true,
 		},
 		{
 			"missing equal sign",
 			`OAuth realm="Example", oauth_version, oauth_signature=""`,
 			nil,
+			true,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := authorizationHeaderParameters(tc.header)
-			if err != nil {
-				if tc.want != nil {
-					t.Fatal(err)
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("want error; got %v", got)
 				}
 			} else {
-				if tc.want == nil {
-					t.Fatalf("want error; got %v", got)
+				if err != nil {
+					t.Fatal(err)
 				}
 			}
 			t.Log(got)

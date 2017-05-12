@@ -500,7 +500,7 @@ func requestParameters(r *http.Request) (url.Values, error) {
 func authorizationHeaderParameters(s string) (url.Values, error) {
 	const scheme = "oauth "
 	if len(s) < len(scheme) || strings.ToLower(s[:len(scheme)]) != scheme {
-		return nil, errors.New("not an OAuth header")
+		return nil, nil
 	}
 	s = s[len(scheme):]
 
