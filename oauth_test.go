@@ -308,19 +308,6 @@ func TestAuthorize(t *testing.T) {
 			}
 		})
 	}
-
-	t.Run("illegal method", func(t *testing.T) {
-		server.LogClientError = testLogger(t)
-		server.LogServerError = testLogger(t)
-		r := httptest.NewRequest("POST", "https://photos.example.net/authorize?oauth_token=hh5s93j4hdidpola", nil)
-
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, r)
-		if wantCode := http.StatusMethodNotAllowed; w.Code != wantCode {
-			t.Logf("response body: %#v", w.Body.String())
-			t.Fatalf("want status code %d; got %d", wantCode, w.Code)
-		}
-	})
 }
 
 func TestTempCredentials(t *testing.T) {

@@ -126,17 +126,7 @@ func (s *Server) TempCredentials(w http.ResponseWriter, r *http.Request) {
 // token's VerificationCode..
 func (s *Server) Authorize(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" {
-			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
-			return
-		}
-
-		err := r.ParseForm()
-		if err != nil {
-			s.writeError(w, newBadRequest("bad query", err))
-			return
-		}
-		tid := r.Form.Get(tokenIdentifier)
+		tid := r.URL.Query().Get(tokenIdentifier)
 		if tid == "" {
 			s.writeError(w, missingParameter(tokenIdentifier))
 			return
