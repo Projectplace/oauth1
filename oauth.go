@@ -222,12 +222,12 @@ func (s *Server) Authenticate(next http.Handler) http.Handler {
 }
 
 func (s *Server) writeError(w http.ResponseWriter, err error) {
-	switch err := errors.Cause(err).(type) {
+	switch e := errors.Cause(err).(type) {
 	case badRequestError:
 		if s.LogClientError != nil {
 			s.LogClientError(err)
 		}
-		http.Error(w, fmt.Sprintf("%s: %s", http.StatusText(http.StatusBadRequest), err.msg), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("%s: %s", http.StatusText(http.StatusBadRequest), e.msg), http.StatusBadRequest)
 	case unauthorized:
 		if s.LogClientError != nil {
 			s.LogClientError(err)
@@ -235,7 +235,7 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		if s.Realm != "" {
 			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`OAuth realm="%s"`, s.Realm))
 		}
-		http.Error(w, fmt.Sprintf("%s: %s", http.StatusText(http.StatusUnauthorized), err), http.StatusUnauthorized)
+		http.Error(w, fmt.Sprintf("%s: %s", http.StatusText(http.StatusUnauthorized), e), http.StatusUnauthorized)
 	default:
 		if s.LogServerError != nil {
 			s.LogServerError(err)
@@ -303,11 +303,12 @@ func (s *Server) validate(r *http.Request, required ...string) (*request, error)
 	}
 
 	if !s.skipVerifySignature {
-		err = s.verifySignature(rr)
+		err = errors.Wrap(s.verifySignature(rr), "invalid signature")
 	}
 
 	if err == nil && !s.skipVerifyNonce {
 		err = s.Store.ConsumeNonce(r.Context(), proto.nonce, proto.timestamp, proto.clientID, proto.tokenID)
+		err = errors.Wrap(err, "failed to verify nonce")
 	}
 	return rr, err
 }
