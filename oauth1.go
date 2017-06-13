@@ -58,6 +58,10 @@ type Server struct {
 	// It is only applied if MaxAge is not zero.
 	MaxSkew time.Duration
 
+	// FixedCallbacks controls if the callback URL should be specified via the
+	// oauth_callback protocol parameter or pre-configured per client.
+	FixedCallbacks bool
+
 	Realm          string      // realm to use in WWW-Authenticate headers
 	LogClientError func(error) // optional logging function that is called on client error responses
 	LogServerError func(error) // optional logging function that is called on server error responses
@@ -97,12 +101,23 @@ type Store interface {
 func (s *Server) TempCredentials(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-www-form-urlencoded")
 
-	rr, err := s.validate(r, callback)
+	required := []string{callback}
+	if s.FixedCallbacks {
+		// RFC 5849 states that oauth_callback must be set to "oob" if the
+		// callback URI has been established by other means, but it doesn't
+		// seem necessary to enforce this.
+		required = nil
+	}
+	rr, err := s.validate(r, required...)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	t, err := newTempToken(rr.client, rr.proto.callback)
+	callback := rr.proto.callback
+	if s.FixedCallbacks {
+		callback = rr.client.Callback
+	}
+	t, err := newTempToken(rr.client, callback)
 	if err == nil {
 		err = s.Store.AddToken(r.Context(), t)
 	}

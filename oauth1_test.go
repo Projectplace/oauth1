@@ -311,10 +311,16 @@ func TestAuthorize(t *testing.T) {
 }
 
 func TestTempCredentials(t *testing.T) {
+	var (
+		callbackRequired = false
+		callbackOptional = true
+	)
+
 	server := newTestServer()
 	testCases := []struct {
-		name    string
-		request string
+		name           string
+		request        string
+		fixedCallbacks bool
 
 		wantCode int
 	}{
@@ -330,6 +336,7 @@ func TestTempCredentials(t *testing.T) {
 				` oauth_callback="http%3A%2F%2Fprinter.example.com%2Fready",` +
 				` oauth_signature="74KNZJeDHnMBp0EMJ9ZHt%2FXKycU%3D"` +
 				"\r\n\r\n",
+			callbackRequired,
 			http.StatusOK,
 		},
 		{
@@ -343,7 +350,22 @@ func TestTempCredentials(t *testing.T) {
 				` oauth_nonce="wIjqoS",` +
 				` oauth_signature="74KNZJeDHnMBp0EMJ9ZHt%2FXKycU%3D"` +
 				"\r\n\r\n",
+			callbackRequired,
 			http.StatusBadRequest,
+		},
+		{
+			"missing but irrelevant callback",
+			"POST /initiate HTTP/1.1\r\n" +
+				"Host: photos.example.net\r\n" +
+				`Authorization: OAuth realm="Photos",` +
+				` oauth_consumer_key="dpf43f3p2l4k3l03",` +
+				` oauth_signature_method="HMAC-SHA1",` +
+				` oauth_timestamp="137131200",` +
+				` oauth_nonce="wIjqoS",` +
+				` oauth_signature="74KNZJeDHnMBp0EMJ9ZHt%2FXKycU%3D"` +
+				"\r\n\r\n",
+			callbackOptional,
+			http.StatusOK,
 		},
 		{
 			"no oauth_consumer_key",
@@ -356,6 +378,7 @@ func TestTempCredentials(t *testing.T) {
 				` oauth_callback="http%3A%2F%2Fprinter.example.com%2Fready",` +
 				` oauth_signature="74KNZJeDHnMBp0EMJ9ZHt%2FXKycU%3D"` +
 				"\r\n\r\n",
+			callbackRequired,
 			http.StatusBadRequest,
 		},
 		{
@@ -369,6 +392,7 @@ func TestTempCredentials(t *testing.T) {
 				` oauth_nonce="wIjqoS",` +
 				` oauth_signature="74KNZJeDHnMBp0EMJ9ZHt%2FXKycU%3D"` +
 				"\r\n\r\n",
+			callbackRequired,
 			http.StatusBadRequest,
 		},
 	}
@@ -382,6 +406,7 @@ func TestTempCredentials(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			server.LogClientError = testLogger(t)
 			server.LogServerError = testLogger(t)
+			server.FixedCallbacks = tc.fixedCallbacks
 			r, err = readRequest(tc.request, true)
 
 			if err != nil {

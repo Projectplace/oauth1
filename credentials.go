@@ -14,6 +14,10 @@ type ClientCredentials struct {
 	ID     string
 	Secret string
 
+	// Callback is an optional pre-configured callback URI for the client. It
+	// is only used if Server.FixedCallbacks is set to true.
+	Callback *url.URL
+
 	// Custom is an extension slot that is not used internally. A caller may
 	// optionally use it to store for example application name or author
 	// information.
