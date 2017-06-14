@@ -1178,67 +1178,6 @@ func Test_authorizationHeaderParameters(t *testing.T) {
 	}
 }
 
-func Test_requestBodyParameters(t *testing.T) {
-	testCases := []struct {
-		name    string
-		request string
-		want    map[string]string
-	}{
-		{
-			"rfc example",
-			"POST /request?b5=%3D%253D&a3=a&c%40=&a2=r%20b HTTP/1.1\r\n" +
-				"Host: example.com\r\n" +
-				"Content-Type: application/x-www-form-urlencoded\r\n" +
-				`Authorization: OAuth realm="Example",` +
-				` oauth_consumer_key="9djdj82h48djs9d2",` +
-				` oauth_token="kkk9d7dh3k39sjv7",` +
-				` oauth_signature_method="HMAC-SHA1",` +
-				` oauth_timestamp="137131201",` +
-				` oauth_nonce="7d8f3e4a",` +
-				` oauth_signature="djosJKDKJSD8743243%2Fjdk33klY%3D"` +
-				"\r\n\r\n" +
-				`c2&a3=2+q`,
-			map[string]string{
-				"c2": "",
-				"a3": "2 q",
-			},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			req, err := readRequest(tc.request, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, err := requestBodyParameters(req)
-			if err != nil {
-				if tc.want != nil {
-					t.Fatal(err)
-				}
-			} else {
-				if tc.want == nil {
-					t.Fatalf("want error; got %v", got)
-				}
-			}
-			for k, want := range tc.want {
-				if got, ok := got[k]; !ok {
-					t.Errorf("want %s %#v but it's missing", k, want)
-				} else if len(got) != 1 {
-					t.Errorf("want %s %#v; got %#v", k, want, got)
-				} else if got := got[0]; got != want {
-					t.Errorf("want %s %#v; got %#v", k, want, got)
-				}
-			}
-			for k, got := range got {
-				if _, ok := tc.want[k]; !ok {
-					t.Errorf("got unwanted %s %#v", k, got)
-				}
-			}
-		})
-	}
-}
-
 func readRequest(s string, https bool) (*http.Request, error) {
 	r := bufio.NewReader(strings.NewReader(s))
 	req, err := http.ReadRequest(r)

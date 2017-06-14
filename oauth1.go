@@ -2,16 +2,12 @@
 package oauth1
 
 import (
-	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
-	"io"
-	"io/ioutil"
-	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -483,21 +479,15 @@ func normalize(params url.Values) string {
 }
 
 func requestParameters(r *http.Request) (url.Values, error) {
-	var params url.Values
-	var err error
-
-	params, err = authorizationHeaderParameters(r.Header.Get("Authorization"))
+	params, err := authorizationHeaderParameters(r.Header.Get("Authorization"))
 	if err != nil {
 		return nil, err
 	}
-	formParams, err := requestBodyParameters(r)
+	err = r.ParseForm()
 	if err != nil {
-		return nil, err
+		return nil, badRequestError{err, "bad form"}
 	}
-	for k, v := range formParams {
-		params[k] = append(params[k], v...)
-	}
-	for k, v := range r.URL.Query() {
+	for k, v := range r.Form {
 		params[k] = append(params[k], v...)
 	}
 	return params, nil
@@ -532,50 +522,6 @@ func authorizationHeaderParameters(s string) (url.Values, error) {
 		h.Add(k, v)
 	}
 	return h, nil
-}
-
-func requestBodyParameters(r *http.Request) (params url.Values, err error) {
-	switch r.Method {
-	case "POST", "PUT", "PATCH":
-		// Should we parse GET request bodies as well?
-	default:
-		return nil, nil
-	}
-
-	ct := r.Header.Get("Content-Type")
-	ct, _, _ = mime.ParseMediaType(ct)
-	if ct != "application/x-www-form-urlencoded" {
-		return nil, nil
-	}
-
-	// take a peek at the request body
-	maxFormSize := int64(10 << 20) // 10 MB is a lot of text.
-	buf := new(bytes.Buffer)
-	reader := io.LimitReader(io.TeeReader(r.Body, buf), maxFormSize+1)
-	defer func() {
-		r.Body = struct {
-			io.Reader
-			io.Closer
-		}{
-			io.MultiReader(buf, r.Body),
-			r.Body,
-		}
-	}()
-
-	b, err := ioutil.ReadAll(reader)
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(b)) > maxFormSize {
-		err = newBadRequest("form too large", errors.New(strconv.Itoa(len(b))))
-		return nil, err
-	}
-	params, err = url.ParseQuery(string(b))
-	if err != nil {
-		err = newBadRequest("bad form", err)
-	}
-
-	return params, err
 }
 
 type clock time.Time
