@@ -493,15 +493,14 @@ func requestParameters(r *http.Request) (url.Values, error) {
 	return params, nil
 }
 
-func authorizationHeaderParameters(s string) (url.Values, error) {
+func authorizationHeaderParameters(s string) (params url.Values, err error) {
+	params = make(url.Values)
 	const scheme = "oauth "
 	if len(s) < len(scheme) || strings.ToLower(s[:len(scheme)]) != scheme {
-		return nil, nil
+		return params, err
 	}
 	s = s[len(scheme):]
 
-	var err error
-	h := make(url.Values)
 	for _, chunk := range strings.Split(s, ",") {
 		chunk = strings.TrimLeftFunc(chunk, unicode.IsSpace)
 		if strings.HasPrefix(chunk, "realm=") {
@@ -519,9 +518,9 @@ func authorizationHeaderParameters(s string) (url.Values, error) {
 		if err != nil {
 			return nil, newBadRequest("bad authorization header", fmt.Errorf("bad value %#v: %v", v, err))
 		}
-		h.Add(k, v)
+		params.Add(k, v)
 	}
-	return h, nil
+	return params, err
 }
 
 type clock time.Time

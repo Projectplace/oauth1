@@ -1057,6 +1057,20 @@ func Test_requestParameters(t *testing.T) {
 				"oauth_signature":        []string{"djosJKDKJSD8743243/jdk33klY="},
 			},
 		},
+		{
+			"no auth header",
+			"POST /request?b5=%3D%253D&a3=a&c%40=&a2=r%20b HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Content-Type: application/x-www-form-urlencoded\r\n\r\n" +
+				`c2&a3=2+q`,
+			map[string][]string{
+				"a2": []string{"r b"},
+				"a3": []string{"2 q", "a"},
+				"b5": []string{"=%3D"},
+				"c@": []string{""},
+				"c2": []string{""},
+			},
+		},
 	}
 
 	for _, tc := range testCases {
