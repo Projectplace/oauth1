@@ -438,6 +438,9 @@ func baseStringURI(r *http.Request) string {
 	if r.TLS != nil {
 		scheme = "https"
 	}
+	if r.Header.Get("X-Forwarded-Proto") != "" {
+		scheme = r.Header.Get("X-Forwarded-Proto")
+	}
 	authority := r.Host
 	if host, port, err := net.SplitHostPort(r.Host); err == nil {
 		switch {
