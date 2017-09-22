@@ -30,9 +30,6 @@ const (
 	callback         = "oauth_callback"
 	tokenIdentifier  = "oauth_token"
 	verificationCode = "oauth_verifier"
-
-	ctxKeyClient = ctxKey("client")
-	ctxKeyToken  = ctxKey("token")
 )
 
 type ctxKey string
@@ -58,9 +55,7 @@ type Server struct {
 	// oauth_callback protocol parameter or pre-configured per client.
 	FixedCallbacks bool
 
-	Realm          string      // realm to use in WWW-Authenticate headers
-	LogClientError func(error) // optional logging function that is called on client error responses
-	LogServerError func(error) // optional logging function that is called on server error responses
+	Realm string // realm to use in WWW-Authenticate headers
 
 	// used for testing only
 	clock               *clock
@@ -91,12 +86,9 @@ type Store interface {
 	ConsumeNonce(ctx context.Context, nonce string, timestamp time.Time, clientID string, tokenID string) error
 }
 
-// TempCredentials creates and responds with new temporary credentials.
-// These are used by the client to obtain authorization from the resource
-// owner.
-func (s *Server) TempCredentials(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/x-www-form-urlencoded")
-
+// TempCredentials creates new temporary credentials. These are used by the
+// client to obtain authorization from the resource owner.
+func (s *Server) TempCredentials(r *http.Request) (*TokenCredentials, error) {
 	required := []string{callback}
 	if s.FixedCallbacks {
 		// RFC 5849 states that oauth_callback must be set to "oob" if the
@@ -106,143 +98,91 @@ func (s *Server) TempCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 	rr, err := s.validate(r, required...)
 	if err != nil {
-		s.writeError(w, err)
-		return
+		return nil, err
 	}
 	callback := rr.proto.callback
 	if s.FixedCallbacks {
 		callback = rr.client.Callback
 	}
 	t, err := newTempToken(rr.client, callback)
-	if err == nil {
-		err = s.Store.AddToken(r.Context(), t)
+	if err != nil {
+		return nil, err
+	}
+	return t, s.Store.AddToken(r.Context(), t)
+}
+
+// Authorize validates a request made by the client to obtain authorization
+// from the resource owner.
+//
+// If access is granted the service provider should redirect the user agent to
+// the token's VerifiedCallback(). If the callback is nil the VerificationCode
+// can be displayed to the user in some other manner.
+func (s *Server) Authorize(r *http.Request) (*ClientCredentials, *TokenCredentials, error) {
+	tid := r.URL.Query().Get(tokenIdentifier)
+	if tid == "" {
+		return nil, nil, missingParameter(tokenIdentifier)
+	}
+	t, err := s.Store.GetToken(r.Context(), tid)
+	if err == ErrNotFound || (err == nil && !t.IsTemporary()) {
+		err = unauthorized{"temporary token not found", s.Realm}
 	}
 	if err != nil {
-		s.writeError(w, err)
-		return
+		return nil, nil, err
 	}
-	res := make(url.Values)
-	res.Set("oauth_callback_confirmed", "true")
-	res.Set("oauth_token", t.ID)
-	res.Set("oauth_token_secret", t.Secret)
-	w.Write([]byte(res.Encode()))
+	c, err := s.Store.GetClient(r.Context(), t.ClientID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return c, t, nil
 }
 
-// Authorize is a middleware that validates requests made by the client to
-// obtain authorization from the resource owner. The client and temporary token
-// are injected in the context of the request.
-//
-// If access is granted the underlying handler should redirect the user agent
-// to the token's VerifiedCallback() if non-nil or otherwise display the
-// token's VerificationCode..
-func (s *Server) Authorize(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tid := r.URL.Query().Get(tokenIdentifier)
-		if tid == "" {
-			s.writeError(w, missingParameter(tokenIdentifier))
-			return
-		}
-		t, err := s.Store.GetToken(r.Context(), tid)
-		if err == ErrNotFound || (err == nil && !t.IsTemporary()) {
-			err = unauthorized("temporary token not found")
-		}
-		if err != nil {
-			s.writeError(w, err)
-			return
-		}
-		c, err := s.Store.GetClient(r.Context(), t.ClientID)
-		if err != nil {
-			s.writeError(w, err)
-			return
-		}
-
-		ctx := r.Context()
-		ctx = context.WithValue(ctx, ctxKeyClient, c)
-		ctx = context.WithValue(ctx, ctxKeyToken, t)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
-// TokenCredentials consumes the supplied temporary token credentials and responds
-// with new token credentials that can be used by the client for authenticated
-// requests.
-func (s *Server) TokenCredentials(w http.ResponseWriter, r *http.Request) {
+// TokenCredentials consumes the supplied temporary token credentials and
+// returns new token credentials that can be used by the client for
+// authenticated requests.
+func (s *Server) TokenCredentials(r *http.Request) (*TokenCredentials, error) {
 	rr, err := s.validate(r, tokenIdentifier, verificationCode)
 	if err != nil {
-		s.writeError(w, err)
-		return
+		return nil, err
 	}
-
-	var t *TokenCredentials
 
 	if subtle.ConstantTimeCompare([]byte(rr.token.VerificationCode), []byte(rr.proto.verificationCode)) != 1 {
-		err = unauthorized("oauth_verifier mismatch")
-	} else {
-		t, err = convertToken(r.Context(), s.Store, rr.token)
+		return nil, unauthorized{"oauth_verifier mismatch", s.Realm}
 	}
-	if err != nil {
-		s.writeError(w, err)
-		return
-	}
+	return convertToken(r.Context(), s.Store, rr.token)
+}
 
+// WriteToken is used to respond to a request for temporary credentials or
+// token credentials.
+func WriteToken(w http.ResponseWriter, t *TokenCredentials) {
 	w.Header().Set("Content-Type", "application/x-www-form-urlencoded")
 	v := make(url.Values)
 	v.Set("oauth_token", t.ID)
 	v.Set("oauth_token_secret", t.Secret)
+	if t.IsTemporary() {
+		v.Set("oauth_callback_confirmed", "true")
+	}
 	w.Write([]byte(v.Encode()))
 }
 
-// Authenticate is a middleware that verifies that incoming requests are
-// protocol compliant and authentic, and respond with an error if not. Valid
-// requests are passed to the underlying handler, with client and token (if
-// applicable) injected into the context.
-func (s *Server) Authenticate(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var (
-			c   *ClientCredentials
-			t   *TokenCredentials
-			err error
-		)
+// Authenticate verifies that the authenticated request is protocol compliant and valid.
+func (s *Server) Authenticate(r *http.Request) (*ClientCredentials, *TokenCredentials, error) {
+	var (
+		c   *ClientCredentials
+		t   *TokenCredentials
+		err error
+	)
 
-		rr, err := s.validate(r)
-		if err != nil {
-			s.writeError(w, err)
-			return
-		}
-		c = rr.client
-		t = rr.token
-		if t != nil && t.IsTemporary() {
-			s.writeError(w, unauthorized("temporary token credentials"))
-			return
-		}
-		ctx := r.Context()
-		ctx = context.WithValue(ctx, ctxKeyClient, c)
-		ctx = context.WithValue(ctx, ctxKeyToken, t)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
-func (s *Server) writeError(w http.ResponseWriter, err error) {
-	switch e := errors.Cause(err).(type) {
-	case badRequestError:
-		if s.LogClientError != nil {
-			s.LogClientError(err)
-		}
-		http.Error(w, fmt.Sprintf("%s: %s", http.StatusText(http.StatusBadRequest), e.msg), http.StatusBadRequest)
-	case unauthorized:
-		if s.LogClientError != nil {
-			s.LogClientError(err)
-		}
-		if s.Realm != "" {
-			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`OAuth realm="%s"`, s.Realm))
-		}
-		http.Error(w, fmt.Sprintf("%s: %s", http.StatusText(http.StatusUnauthorized), e), http.StatusUnauthorized)
-	default:
-		if s.LogServerError != nil {
-			s.LogServerError(err)
-		}
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+	rr, err := s.validate(r)
+	if err != nil {
+		return nil, nil, err
 	}
+	c = rr.client
+	t = rr.token
+	if t != nil && t.IsTemporary() {
+		return nil, nil, unauthorized{"temporary token credentials", s.Realm}
+	}
+	return c, t, nil
 }
 
 type request struct {
@@ -277,7 +217,7 @@ func (s *Server) validate(r *http.Request, required ...string) (*request, error)
 	if s.MaxSkew > 0 {
 		switch d := s.clock.Now().Sub(proto.timestamp); {
 		case d-s.MaxSkew > s.MaxAge:
-			return nil, unauthorized(fmt.Sprintf("timestamp expired %s ago", d-s.MaxAge))
+			return nil, unauthorized{fmt.Sprintf("timestamp expired %s ago", d-s.MaxAge), s.Realm}
 		case d+s.MaxSkew < 0:
 			return nil, newBadRequest(fmt.Sprintf("timestamp set %s in future", -d), errors.New("bad timestamp"))
 		}
@@ -286,7 +226,7 @@ func (s *Server) validate(r *http.Request, required ...string) (*request, error)
 	rr.client, err = s.Store.GetClient(r.Context(), proto.clientID)
 	if err != nil {
 		if err == ErrNotFound {
-			return rr, unauthorized("client not found")
+			return rr, unauthorized{"client not found", s.Realm}
 		}
 		return rr, errors.Wrap(err, "failed to fetch client")
 	}
@@ -294,12 +234,12 @@ func (s *Server) validate(r *http.Request, required ...string) (*request, error)
 		rr.token, err = s.Store.GetToken(r.Context(), proto.tokenID)
 		if err != nil {
 			if err == ErrNotFound {
-				return rr, unauthorized("token not found")
+				return rr, unauthorized{"token not found", s.Realm}
 			}
 			return rr, errors.Wrapf(err, "failed to fetch token %s", proto.tokenID)
 		}
 		if rr.token.ClientID != proto.clientID {
-			return rr, unauthorized("client/token mismatch")
+			return rr, unauthorized{"client/token mismatch", s.Realm}
 		}
 	}
 
@@ -309,6 +249,9 @@ func (s *Server) validate(r *http.Request, required ...string) (*request, error)
 
 	if err == nil && !s.skipVerifyNonce {
 		err = s.Store.ConsumeNonce(r.Context(), proto.nonce, proto.timestamp, proto.clientID, proto.tokenID)
+		if err == ErrNonceAlreadyUsed {
+			err = unauthorized{"nonce already used", s.Realm}
+		}
 		err = errors.Wrap(err, "failed to verify nonce")
 	}
 	return rr, err
@@ -534,20 +477,3 @@ func (c *clock) Now() time.Time {
 	}
 	return time.Time(*c)
 }
-
-// GetToken returns the token credentials from a request context if available.
-// If no token is available nil is returned.
-func GetToken(ctx context.Context) *TokenCredentials {
-	id, _ := ctx.Value(ctxKeyToken).(*TokenCredentials)
-	return id
-}
-
-// GetClient returns the client credentials from a request context if available.
-// If no client is available nil is returned.
-func GetClient(ctx context.Context) *ClientCredentials {
-	id, _ := ctx.Value(ctxKeyClient).(*ClientCredentials)
-	return id
-}
-
-var _ http.HandlerFunc = (*Server)(nil).TempCredentials
-var _ http.HandlerFunc = (*Server)(nil).TokenCredentials

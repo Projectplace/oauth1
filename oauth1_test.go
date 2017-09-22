@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pkg/errors"
 )
 
 var (
@@ -48,23 +50,12 @@ var (
 func TestAuthenticate(t *testing.T) {
 	server := newTestServer()
 
-	// the protected resource handler
-	handler := server.Authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Log(r.Context())
-		c := GetClient(r.Context())
-		t := GetToken(r.Context())
-		w.Write([]byte(c.ID))
-		w.Write([]byte{'.'})
-		if t != nil {
-			w.Write([]byte(t.ID))
-		}
-	}))
-
 	testCases := []struct {
-		name     string
-		request  string
-		wantCode int
-		wantBody string
+		name       string
+		request    string
+		wantClient *ClientCredentials
+		wantToken  *TokenCredentials
+		wantCode   int
 	}{
 		{
 			"rfc example",
@@ -76,8 +67,9 @@ func TestAuthenticate(t *testing.T) {
 				` oauth_signature_method="HMAC-SHA1",` +
 				` oauth_timestamp="137131202"` +
 				"\r\n\r\n",
+			printerClient,
+			photoToken,
 			http.StatusOK,
-			printerClient.ID + "." + photoToken.ID,
 		},
 		{
 			"temp token",
@@ -89,8 +81,9 @@ func TestAuthenticate(t *testing.T) {
 				` oauth_signature_method="HMAC-SHA1",` +
 				` oauth_timestamp="137131202"` +
 				"\r\n\r\n",
+			nil,
+			nil,
 			http.StatusUnauthorized,
-			"",
 		},
 		{
 			"missing token",
@@ -101,8 +94,9 @@ func TestAuthenticate(t *testing.T) {
 				` oauth_signature_method="HMAC-SHA1",` +
 				` oauth_timestamp="137131202"` +
 				"\r\n\r\n",
+			printerClient,
+			nil,
 			http.StatusOK,
-			printerClient.ID + ".",
 		},
 		{
 			"invalid token",
@@ -114,8 +108,9 @@ func TestAuthenticate(t *testing.T) {
 				` oauth_signature_method="HMAC-SHA1",` +
 				` oauth_timestamp="137131202"` +
 				"\r\n\r\n",
+			nil,
+			nil,
 			http.StatusUnauthorized,
-			"",
 		},
 		{
 			"missing consumer_key",
@@ -126,25 +121,26 @@ func TestAuthenticate(t *testing.T) {
 				` oauth_signature_method="HMAC-SHA1",` +
 				` oauth_timestamp="137131202"` +
 				"\r\n\r\n",
+			nil,
+			nil,
 			http.StatusBadRequest,
-			"",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			server.LogClientError = testLogger(t)
-			server.LogServerError = testLogger(t)
 			r, _ := readRequest(tc.request, true)
-			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, r)
+			cli, tkn, err := server.Authenticate(r)
 
-			if w.Code != tc.wantCode {
-				t.Logf("response body: %#v", w.Body.String())
-				t.Fatalf("want status code %d; got %d", tc.wantCode, w.Code)
+			if code := errCode(err); code != tc.wantCode {
+				t.Logf("client %v; token %v", cli, tkn)
+				t.Fatalf("want status %d; error `%v` would result in status %d", tc.wantCode, err, code)
 			}
-			if tc.wantBody != "" && w.Body.String() != tc.wantBody {
-				t.Errorf("want body %s; got %s", tc.wantBody, w.Body.String())
+			if !cli.is(tc.wantClient) {
+				t.Errorf("want client %v; got %v", tc.wantClient, cli)
+			}
+			if !tkn.is(tc.wantToken) {
+				t.Errorf("want token %v; got %v", tc.wantToken, tkn)
 			}
 		})
 	}
@@ -154,9 +150,9 @@ func TestTokenCredentials(t *testing.T) {
 	server := newTestServer()
 
 	testCases := []struct {
-		name     string
-		request  string
-		wantCode int
+		name    string
+		request string
+		wantErr error
 	}{
 		{
 			"rfc example",
@@ -170,7 +166,7 @@ func TestTokenCredentials(t *testing.T) {
 				` oauth_verifier="hfdp7dh39dks9884",` +
 				` oauth_signature="gKgrFCywp7rO0OXSjdot%2FIHF7IU%3D"` +
 				"\r\n\r\n",
-			http.StatusOK,
+			nil,
 		},
 		{
 			"missing oauth_token",
@@ -183,7 +179,7 @@ func TestTokenCredentials(t *testing.T) {
 				` oauth_verifier="secret",` +
 				` oauth_signature="gKgrFCywp7rO0OXSjdot%2FIHF7IU%3D"` +
 				"\r\n\r\n",
-			http.StatusBadRequest,
+			missingParameter("oauth_token"),
 		},
 		{
 			"missing oauth_verifier",
@@ -196,7 +192,7 @@ func TestTokenCredentials(t *testing.T) {
 				` oauth_timestamp="137131201",` +
 				` oauth_signature="gKgrFCywp7rO0OXSjdot%2FIHF7IU%3D"` +
 				"\r\n\r\n",
-			http.StatusBadRequest,
+			missingParameter("oauth_verifier"),
 		},
 		{
 			"invalid oauth_verifier",
@@ -210,37 +206,37 @@ func TestTokenCredentials(t *testing.T) {
 				` oauth_verifier="baz",` +
 				` oauth_signature="gKgrFCywp7rO0OXSjdot%2FIHF7IU%3D"` +
 				"\r\n\r\n",
-			http.StatusUnauthorized,
+			unauthorized{"oauth_verifier mismatch", ""},
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			server.LogClientError = testLogger(t)
-			server.LogServerError = testLogger(t)
 			r, _ := readRequest(tc.request, true)
-			w := httptest.NewRecorder()
-			server.TokenCredentials(w, r)
+			tkn, err := server.TokenCredentials(r)
 
-			t.Logf("response body: %#v", w.Body.String())
-			if w.Code != tc.wantCode {
-				t.Fatalf("want status code %d; got %d", tc.wantCode, w.Code)
-			}
-			if w.Code != http.StatusOK {
+			if tc.wantErr != nil {
+				if err == nil {
+					t.Fatalf("want error `%v`; got ok", tc.wantErr)
+				}
+				if err := errors.Cause(err); err.Error() != tc.wantErr.Error() {
+					t.Fatalf("want error caused by `%v`; got error caused by `%v`", tc.wantErr, err)
+				}
 				return
 			}
 
-			if ct := w.HeaderMap.Get("content-type"); ct != "application/x-www-form-urlencoded" {
-				t.Errorf("bad content-type: %#v", ct)
-			}
-			values, err := url.ParseQuery(w.Body.String())
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("got unexpected error `%v`", err)
 			}
-			for _, k := range []string{"oauth_token", "oauth_token_secret"} {
-				if values.Get(k) == "" {
-					t.Errorf("missing value for %v", k)
-				}
+
+			if tkn.IsTemporary() {
+				t.Error("got temporary credentials")
+			}
+			if tkn.ID == "" {
+				t.Error("ID missing from token credentials")
+			}
+			if tkn.Secret == "" {
+				t.Error("Secret missing from token credentials")
 			}
 		})
 	}
@@ -250,61 +246,58 @@ func TestAuthorize(t *testing.T) {
 	server := newTestServer()
 	server.skipVerifySignature = false
 	server.skipVerifyNonce = false
-	handler := server.Authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c := GetClient(r.Context())
-		t := GetToken(r.Context())
-		w.Write([]byte(c.ID))
-		w.Write([]byte{'.'})
-		if t != nil {
-			w.Write([]byte(t.ID))
-		}
-	}))
 
 	testCases := []struct {
-		name     string
-		url      string
-		wantCode int
-		wantBody string
+		name       string
+		url        string
+		wantClient *ClientCredentials
+		wantToken  *TokenCredentials
+		wantCode   int
 	}{
 		{
 			"rfc example",
 			"https://photos.example.net/authorize?oauth_token=hh5s93j4hdidpola",
+			printerClient,
+			tempToken,
 			http.StatusOK,
-			printerClient.ID + "." + tempToken.ID,
 		},
 		{
 			"missing token parameter",
 			"https://photos.example.net/authorize",
+			nil,
+			nil,
 			http.StatusBadRequest,
-			"",
 		},
 		{
 			"invalid token parameter",
 			"https://photos.example.net/authorize?oauth_token=aaaaaaaaaaaaaaaa",
+			nil,
+			nil,
 			http.StatusUnauthorized,
-			"",
 		},
 		{
 			"non-temporary token",
 			"https://photos.example.net/authorize?oauth_token=nnch734d00sl2jdk",
+			nil,
+			nil,
 			http.StatusUnauthorized,
-			"",
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			server.LogClientError = testLogger(t)
-			server.LogServerError = testLogger(t)
-			r := httptest.NewRequest("GET", tc.url, nil)
-			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, r)
 
-			if w.Code != tc.wantCode {
-				t.Logf("response body: %#v", w.Body.String())
-				t.Fatalf("want status code %d; got %d", tc.wantCode, w.Code)
+			r := httptest.NewRequest("GET", tc.url, nil)
+			cli, tkn, err := server.Authorize(r)
+
+			if code := errCode(err); code != tc.wantCode {
+				t.Logf("client %v; token %v", cli, tkn)
+				t.Fatalf("want status %d; error `%v` would result in status %d", tc.wantCode, err, code)
 			}
-			if tc.wantBody != "" && w.Body.String() != tc.wantBody {
-				t.Errorf("want body %s; got %s", tc.wantBody, w.Body.String())
+			if !cli.is(tc.wantClient) {
+				t.Errorf("want client %v; got %v", tc.wantClient, cli)
+			}
+			if !tkn.is(tc.wantToken) {
+				t.Errorf("want token %v; got %v", tc.wantToken, tkn)
 			}
 		})
 	}
@@ -322,7 +315,7 @@ func TestTempCredentials(t *testing.T) {
 		request        string
 		fixedCallbacks bool
 
-		wantCode int
+		wantErr error
 	}{
 		{
 			"rfc example",
@@ -337,7 +330,7 @@ func TestTempCredentials(t *testing.T) {
 				` oauth_signature="74KNZJeDHnMBp0EMJ9ZHt%2FXKycU%3D"` +
 				"\r\n\r\n",
 			callbackRequired,
-			http.StatusOK,
+			nil,
 		},
 		{
 			"missing callback",
@@ -351,7 +344,7 @@ func TestTempCredentials(t *testing.T) {
 				` oauth_signature="74KNZJeDHnMBp0EMJ9ZHt%2FXKycU%3D"` +
 				"\r\n\r\n",
 			callbackRequired,
-			http.StatusBadRequest,
+			missingParameter("oauth_callback"),
 		},
 		{
 			"missing but irrelevant callback",
@@ -365,7 +358,7 @@ func TestTempCredentials(t *testing.T) {
 				` oauth_signature="74KNZJeDHnMBp0EMJ9ZHt%2FXKycU%3D"` +
 				"\r\n\r\n",
 			callbackOptional,
-			http.StatusOK,
+			nil,
 		},
 		{
 			"no oauth_consumer_key",
@@ -379,49 +372,69 @@ func TestTempCredentials(t *testing.T) {
 				` oauth_signature="74KNZJeDHnMBp0EMJ9ZHt%2FXKycU%3D"` +
 				"\r\n\r\n",
 			callbackRequired,
-			http.StatusBadRequest,
-		},
-		{
-			"invalid parameter",
-			"POST /initiate HTTP/1.1\r\n" +
-				"Host: photos.example.net\r\n" +
-				`Authorization: OAuth realm="Photos",` +
-				` oauth_consumer_key="dpf43f3p2l4k3l03",` +
-				` oauth_signature_method="HMAC-SHA1",` +
-				` oauth_timestamp="xxx",` +
-				` oauth_nonce="wIjqoS",` +
-				` oauth_signature="74KNZJeDHnMBp0EMJ9ZHt%2FXKycU%3D"` +
-				"\r\n\r\n",
-			callbackRequired,
-			http.StatusBadRequest,
+			missingParameter("oauth_consumer_key"),
 		},
 	}
 
 	var (
-		w   *httptest.ResponseRecorder
 		r   *http.Request
 		err error
 	)
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			server.LogClientError = testLogger(t)
-			server.LogServerError = testLogger(t)
 			server.FixedCallbacks = tc.fixedCallbacks
 			r, err = readRequest(tc.request, true)
 
 			if err != nil {
 				t.Fatal(err)
 			}
-			w = httptest.NewRecorder()
-			server.TempCredentials(w, r)
+			tkn, err := server.TempCredentials(r)
 
-			t.Logf("response body: %#v", w.Body.String())
-			if w.Code != tc.wantCode {
-				t.Fatalf("want status code %d; got %d", tc.wantCode, w.Code)
-			}
-			if w.Code != http.StatusOK {
+			if tc.wantErr != nil {
+				if err == nil {
+					t.Fatalf("want error `%v`; got ok", tc.wantErr)
+				}
+				if err := errors.Cause(err); err.Error() != tc.wantErr.Error() {
+					t.Fatalf("want error caused by `%v`; got error caused by `%v`", tc.wantErr, err)
+				}
 				return
 			}
+
+			if err != nil {
+				t.Fatalf("got unexpected error `%v`", err)
+			}
+
+			if !tkn.IsTemporary() {
+				t.Error("got non-temporary credentials")
+			}
+			if tkn.ID == "" {
+				t.Error("ID missing from temporary credentials")
+			}
+			if tkn.Secret == "" {
+				t.Error("Secret missing from temporary credentials")
+			}
+		})
+	}
+}
+
+func TestWriteToken(t *testing.T) {
+	testCases := []struct {
+		name        string
+		isTemporary bool
+	}{
+		{"temp credentials", true},
+		{"token credentials", false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tkn := &TokenCredentials{ID: "123", Secret: "abc"}
+			if tc.isTemporary {
+				tkn.VerificationCode = "xyz"
+			}
+
+			w := httptest.NewRecorder()
+			WriteToken(w, tkn)
 
 			if ct := w.HeaderMap.Get("content-type"); ct != "application/x-www-form-urlencoded" {
 				t.Errorf("bad content-type: %#v", ct)
@@ -430,15 +443,20 @@ func TestTempCredentials(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if v := values.Get("oauth_callback_confirmed"); v != "true" {
-				t.Errorf(`want oauth_callback_confirmed="true"; got %#v`, v)
+
+			if tc.isTemporary {
+				if v := values.Get("oauth_callback_confirmed"); v != "true" {
+					t.Errorf(`want oauth_callback_confirmed="true"; got %#v`, v)
+				}
 			}
+
 			for _, k := range []string{"oauth_token", "oauth_token_secret"} {
 				if values.Get(k) == "" {
 					t.Errorf("missing value for %v", k)
 				}
 			}
 		})
+
 	}
 }
 
@@ -606,8 +624,6 @@ func Test_validate(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			server.LogClientError = testLogger(t)
-			server.LogServerError = testLogger(t)
 			req, err := readRequest(tc.request, tc.https)
 			if err != nil {
 				t.Fatal(err)
@@ -639,8 +655,6 @@ func Test_validate(t *testing.T) {
 				continue
 			}
 			t.Run(tc.name, func(t *testing.T) {
-				server.LogClientError = testLogger(t)
-				server.LogServerError = testLogger(t)
 				req, err := readRequest(tc.request, tc.https)
 				if err != nil {
 					t.Fatal(err)
@@ -1236,8 +1250,16 @@ func newTestServer() *Server {
 	return server
 }
 
-func testLogger(t *testing.T) func(error) {
-	return func(err error) {
-		t.Log(err)
+func errCode(err error) int {
+	err = errors.Cause(err)
+	if err == nil {
+		return http.StatusOK
 	}
+	switch err.(type) {
+	case unauthorized:
+		return http.StatusUnauthorized
+	case badRequestError:
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
 }

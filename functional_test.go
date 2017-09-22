@@ -84,9 +84,6 @@ func newHTTPTestServer(t *testing.T) (*http.ServeMux, *httptest.Server) {
 		Store:   db,
 		MaxAge:  5 * time.Second,
 		MaxSkew: time.Second,
-
-		LogClientError: testLogger(t),
-		LogServerError: testLogger(t),
 	}
 	clientCredentials := &ClientCredentials{
 		ID:     clientID,
@@ -95,25 +92,45 @@ func newHTTPTestServer(t *testing.T) (*http.ServeMux, *httptest.Server) {
 	db.mustAddClient(clientCredentials)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/initiate", s.TempCredentials)
-	mux.Handle("/authorize", s.Authorize(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cli := GetClient(r.Context())
-		tkn := GetToken(r.Context())
+	mux.HandleFunc("/initiate", func(w http.ResponseWriter, r *http.Request) {
+		tkn, err := s.TempCredentials(r)
+		if err != nil {
+			t.Error(err)
+			WriteError(w, err)
+			return
+		}
+		WriteToken(w, tkn)
+	})
+	mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
+		cli, tkn, err := s.Authorize(r)
 		t.Log("client:", cli)
 		t.Log("token:", tkn)
+		if err != nil {
+			t.Error(err)
+			WriteError(w, err)
+			return
+		}
 		http.Redirect(w, r, tkn.VerifiedCallback().String(), http.StatusFound)
-	})))
-	mux.HandleFunc("/token", s.TokenCredentials)
-	mux.Handle("/protected", s.Authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cli := GetClient(r.Context())
-		tkn := GetToken(r.Context())
-		if cli == nil || tkn == nil {
-			t.Log("client:", cli)
-			t.Log("token:", tkn)
-			http.Error(w, "missing token/client", http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		tkn, err := s.TokenCredentials(r)
+		if err != nil {
+			t.Error(err)
+			WriteError(w, err)
+			return
+		}
+		WriteToken(w, tkn)
+	})
+	mux.HandleFunc("/protected", func(w http.ResponseWriter, r *http.Request) {
+		cli, tkn, err := s.Authenticate(r)
+		t.Log("client:", cli)
+		t.Log("token:", tkn)
+		if err != nil {
+			t.Error(err)
+			WriteError(w, err)
 			return
 		}
 		w.Write([]byte("ok!"))
-	})))
+	})
 	return mux, httptest.NewServer(mux)
 }

@@ -1,7 +1,9 @@
 package oauth1
 
 import (
+	"fmt"
 	"net/url"
+	"reflect"
 	"testing"
 )
 
@@ -46,4 +48,20 @@ func TestTokenCallback(t *testing.T) {
 			}
 		})
 	}
+}
+
+func (c *ClientCredentials) String() string {
+	return fmt.Sprintf("<client %v>", c.ID)
+}
+
+func (c *ClientCredentials) is(cc *ClientCredentials) bool {
+	return reflect.DeepEqual(c, cc)
+}
+
+func (t *TokenCredentials) String() string {
+	return fmt.Sprintf("<token %v>", t.ID)
+}
+
+func (t *TokenCredentials) is(tt *TokenCredentials) bool {
+	return reflect.DeepEqual(t, tt)
 }

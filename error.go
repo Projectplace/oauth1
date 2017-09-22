@@ -2,6 +2,7 @@ package oauth1
 
 import (
 	"fmt"
+	"net/http"
 
 	"github.com/pkg/errors"
 )
@@ -10,8 +11,32 @@ var (
 	// ErrNotFound is the error resulting if a matching token or client can not be found.
 	ErrNotFound = errors.New("not found")
 	// ErrNonceAlreadyUsed is the error resulting if a nonce is re-used.
-	ErrNonceAlreadyUsed = unauthorized("nonce already used")
+	ErrNonceAlreadyUsed = errors.New("nonce already used")
 )
+
+// WriteError is used to write an error response to the client.
+func WriteError(w http.ResponseWriter, err error) {
+	switch e := errors.Cause(err).(type) {
+	case badRequestError:
+		http.Error(w, fmt.Sprintf("%s: %s", http.StatusText(http.StatusBadRequest), e.msg), http.StatusBadRequest)
+	case unauthorized:
+		if e.realm != "" {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`OAuth realm="%s"`, e.realm))
+		}
+		http.Error(w, fmt.Sprintf("%s: %s", http.StatusText(http.StatusUnauthorized), e), http.StatusUnauthorized)
+	default:
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+	}
+}
+
+// IsInternal returns true if the error is caused by an internal error.
+func IsInternal(err error) bool {
+	switch errors.Cause(err).(type) {
+	case badRequestError, unauthorized:
+		return false
+	}
+	return true
+}
 
 type badRequestError struct {
 	err error
@@ -22,10 +47,13 @@ func (e badRequestError) Error() string {
 	return e.err.Error()
 }
 
-type unauthorized string
+type unauthorized struct {
+	msg   string
+	realm string
+}
 
 func (e unauthorized) Error() string {
-	return string(e)
+	return e.msg
 }
 
 func newBadRequest(msg string, err error) badRequestError {
