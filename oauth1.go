@@ -272,7 +272,7 @@ func (s *Server) verifySignature(r *request) error {
 		return err
 	}
 	if !hmac.Equal(r.proto.signature, mac.Sum(nil)) {
-		return errors.New("signature mismatch")
+		return unauthorized{"signature mismatch", s.Realm}
 	}
 	return nil
 }
