@@ -58,7 +58,7 @@ type Server struct {
 	Realm string // realm to use in WWW-Authenticate headers
 
 	// used for testing only
-	clock               *clock
+	time                *clock
 	skipVerifySignature bool
 	skipVerifyNonce     bool
 }
@@ -214,12 +214,12 @@ func (s *Server) validate(r *http.Request, required ...string) (*request, error)
 
 	rr := &request{Request: r, rawProto: params, proto: proto}
 
-	if s.MaxSkew > 0 {
-		switch d := s.clock.Now().Sub(proto.timestamp); {
-		case d-s.MaxSkew > s.MaxAge:
-			return nil, unauthorized{fmt.Sprintf("timestamp expired %s ago", d-s.MaxAge), s.Realm}
-		case d+s.MaxSkew < 0:
-			return nil, newBadRequest(fmt.Sprintf("timestamp set %s in future", -d), errors.New("bad timestamp"))
+	if s.MaxAge > 0 {
+		if dt := s.time.Since(proto.timestamp); dt > s.MaxAge+s.MaxSkew {
+			return nil, unauthorized{fmt.Sprintf("timestamp expired %s ago", dt), s.Realm}
+		}
+		if dt := s.time.Until(proto.timestamp); dt > s.MaxSkew {
+			return nil, newBadRequest(fmt.Sprintf("timestamp set %s in future", dt), errors.New("bad timestamp"))
 		}
 	}
 
@@ -471,9 +471,16 @@ func authorizationHeaderParameters(s string) (params url.Values, err error) {
 
 type clock time.Time
 
-func (c *clock) Now() time.Time {
+func (c *clock) Since(t time.Time) time.Duration {
 	if c == nil {
-		return time.Now()
+		return time.Since(t)
 	}
-	return time.Time(*c)
+	return time.Time(*c).Sub(t)
+}
+
+func (c *clock) Until(t time.Time) time.Duration {
+	if c == nil {
+		return time.Until(t)
+	}
+	return t.Sub(time.Time(*c))
 }

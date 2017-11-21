@@ -1238,9 +1238,9 @@ func newTestServer() *Server {
 		MaxSkew:             5 * time.Minute,
 		skipVerifySignature: true,
 		skipVerifyNonce:     true,
-		clock:               new(clock),
+		time:                new(clock),
 	}
-	*(server.clock) = clock(time.Unix(137131500, 0))
+	*(server.time) = clock(time.Unix(137131500, 0))
 	db.mustAddClient(printerClient)
 	db.mustAddToken(tempToken)
 	db.mustAddToken(photoToken)
