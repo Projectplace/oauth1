@@ -8,13 +8,15 @@ import (
 )
 
 var (
-	// ErrNotFound is the error resulting if a matching token or client can not be found.
+	// ErrNotFound is the error returned by Store methods if a token or client
+	// can not be found.
 	ErrNotFound = errors.New("not found")
-	// ErrNonceAlreadyUsed is the error resulting if a nonce is re-used.
+	// ErrNonceAlreadyUsed is the error returned by ConsumeNonce if a nonce is
+	// re-used.
 	ErrNonceAlreadyUsed = errors.New("nonce already used")
 )
 
-// WriteError is used to write an error response to the client.
+// WriteError encodes and writes err to w with the appropriate status code.
 func WriteError(w http.ResponseWriter, err error) {
 	switch e := errors.Cause(err).(type) {
 	case badRequestError:
@@ -29,7 +31,7 @@ func WriteError(w http.ResponseWriter, err error) {
 	}
 }
 
-// IsInternal returns true if the error is caused by an internal error.
+// IsInternal returns true if err is caused by an internal server error.
 func IsInternal(err error) bool {
 	switch errors.Cause(err).(type) {
 	case badRequestError, unauthorized:

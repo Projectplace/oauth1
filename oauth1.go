@@ -32,9 +32,7 @@ const (
 	verificationCode = "oauth_verifier"
 )
 
-type ctxKey string
-
-// Server provides methods for interacting with oauth 1.0 clients.
+// Server provides methods for interacting with OAuth 1.0 clients.
 type Server struct {
 	// Store is the database used to store credentials and nonces.
 	Store Store
@@ -55,7 +53,11 @@ type Server struct {
 	// oauth_callback protocol parameter or pre-configured per client.
 	FixedCallbacks bool
 
-	Realm string // realm to use in WWW-Authenticate headers
+	// Realm is the description of the protected area to be included in
+	// WWW-Authenticate headers.
+	//
+	// If Realm is empty WWW-Authenticate headers are suppressed.
+	Realm string
 
 	// used for testing only
 	time                *clock
@@ -65,30 +67,36 @@ type Server struct {
 
 // Store is the interface used to manage credentials and nonces.
 type Store interface {
-	// GetClient reads the credentials with the given ID from the database.
-	// ErrNotFound is returned if no matching record can be found.
+	// GetClient loads the credentials with the given ID from the database.
+	// It returns ErrNotFound if no matching record can be found.
 	GetClient(ctx context.Context, id string) (*ClientCredentials, error)
 
-	// AddToken adds a new token to the database. The ID may optionally be
-	// changed prior to persisting the credentials.
-	AddToken(ctx context.Context, t *TokenCredentials) error
-
-	// GetToken reads the credentials with the given ID from the database.
-	// ErrNotFound is returned if no matching record can be found.
+	// GetToken loads the token credentials with the given ID from the
+	// database. It returns ErrNotFound if no matching record can be found.
 	GetToken(ctx context.Context, id string) (*TokenCredentials, error)
 
-	// ReplaceToken deletes the old token credentials and adds the new ones.
-	// If no matching record can be found ErrNotFound is returned.
-	ReplaceToken(ctx context.Context, old, new *TokenCredentials) error
+	// GetToken loads the temporary credentials with the given ID from the
+	// database. It returns ErrNotFound if no matching record can be found.
+	GetTemp(ctx context.Context, id string) (*TempCredentials, error)
 
-	// ConsumeNonce returns ErrAlreadyExists if the nonce is not unique to the
-	// timestamp, client and token combination.
-	ConsumeNonce(ctx context.Context, nonce string, timestamp time.Time, clientID string, tokenID string) error
+	// AddTempCredentials adds new temporary credentials to the database.
+	AddTempCredentials(context.Context, *TempCredentials) error
+
+	// ConvertTempCredentials replaces the temporary credentials with token
+	// credentials.
+	ConvertTempCredentials(ctx context.Context, old *TempCredentials, new *TokenCredentials) error
+
+	// ConsumeNonce validates that a nonce is unique across all requests with
+	// the same timestamp, client and token combinations. If the combination
+	// has been used before ConsumeNonce returns ErrNonceAlreadyUsed.
+	ConsumeNonce(ctx context.Context, nonce string, timestamp time.Time, clientID, tokenID string) error
 }
 
-// TempCredentials creates new temporary credentials. These are used by the
-// client to obtain authorization from the resource owner.
-func (s *Server) TempCredentials(r *http.Request) (*TokenCredentials, error) {
+// InitiateAuthorization validates a request for new temporary credentials and
+// creates them if successful.
+//
+// This is the first step taken by a client to acquire token credentials.
+func (s *Server) InitiateAuthorization(r *http.Request) (*TempCredentials, error) {
 	required := []string{callback}
 	if s.FixedCallbacks {
 		// RFC 5849 states that oauth_callback must be set to "oob" if the
@@ -96,7 +104,7 @@ func (s *Server) TempCredentials(r *http.Request) (*TokenCredentials, error) {
 		// seem necessary to enforce this.
 		required = nil
 	}
-	rr, err := s.validate(r, required...)
+	rr, err := s.validate(r, false, required...)
 	if err != nil {
 		return nil, err
 	}
@@ -108,28 +116,29 @@ func (s *Server) TempCredentials(r *http.Request) (*TokenCredentials, error) {
 	if err != nil {
 		return nil, err
 	}
-	return t, s.Store.AddToken(r.Context(), t)
+	return t, s.Store.AddTempCredentials(r.Context(), t)
 }
 
-// Authorize validates a request made by the client to obtain authorization
-// from the resource owner.
+// RequestAuthorization validates a request made by the client to obtain
+// authorization from the resource owner.
 //
-// If access is granted the service provider should redirect the user agent to
-// the token's VerifiedCallback(). If the callback is nil the VerificationCode
-// can be displayed to the user in some other manner.
-func (s *Server) Authorize(r *http.Request) (*ClientCredentials, *TokenCredentials, error) {
+// The service provider must ask the resource owner to grant access,
+// and if authorization is given the user agent should be redirected
+// to the token's VerifiedCallback(). If this callback is nil the
+// VerificationCode should instead be displayed together with instructions
+// to manually inform the client that authorization is completed.
+//
+// This is the second step for a client to acquire token credentials.
+func (s *Server) RequestAuthorization(r *http.Request) (*ClientCredentials, *TempCredentials, error) {
 	tid := r.URL.Query().Get(tokenIdentifier)
 	if tid == "" {
 		return nil, nil, missingParameter(tokenIdentifier)
 	}
-	t, err := s.Store.GetToken(r.Context(), tid)
-	if err == ErrNotFound || (err == nil && !t.IsTemporary()) {
-		err = unauthorized{"temporary token not found", s.Realm}
-	}
+	t, err := s.getTemp(r.Context(), tid)
 	if err != nil {
 		return nil, nil, err
 	}
-	c, err := s.Store.GetClient(r.Context(), t.ClientID)
+	c, err := s.getClient(r.Context(), t.ClientID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -137,35 +146,37 @@ func (s *Server) Authorize(r *http.Request) (*ClientCredentials, *TokenCredentia
 	return c, t, nil
 }
 
-// TokenCredentials consumes the supplied temporary token credentials and
-// returns new token credentials that can be used by the client for
+// ConcludeAuthorization consumes the supplied temporary token credentials
+// and returns new token credentials that can be used by the client for
 // authenticated requests.
-func (s *Server) TokenCredentials(r *http.Request) (*TokenCredentials, error) {
-	rr, err := s.validate(r, tokenIdentifier, verificationCode)
+//
+// This is the third and final step for a client to acquire token credentials.
+func (s *Server) ConcludeAuthorization(r *http.Request) (*TokenCredentials, error) {
+	rr, err := s.validate(r, true, tokenIdentifier, verificationCode)
 	if err != nil {
 		return nil, err
 	}
 
-	if subtle.ConstantTimeCompare([]byte(rr.token.VerificationCode), []byte(rr.proto.verificationCode)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(rr.temp.VerificationCode), []byte(rr.proto.verificationCode)) != 1 {
 		return nil, unauthorized{"oauth_verifier mismatch", s.Realm}
 	}
-	return convertToken(r.Context(), s.Store, rr.token)
-}
 
-// WriteToken is used to respond to a request for temporary credentials or
-// token credentials.
-func WriteToken(w http.ResponseWriter, t *TokenCredentials) {
-	w.Header().Set("Content-Type", "application/x-www-form-urlencoded")
-	v := make(url.Values)
-	v.Set("oauth_token", t.ID)
-	v.Set("oauth_token_secret", t.Secret)
-	if t.IsTemporary() {
-		v.Set("oauth_callback_confirmed", "true")
+	t, err := newToken(rr.client)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create token")
 	}
-	w.Write([]byte(v.Encode()))
+	t.Custom = rr.temp.Custom
+	err = s.Store.ConvertTempCredentials(r.Context(), rr.temp, t)
+	if err == ErrNotFound {
+		return nil, unauthorized{"temporary credentials not found", s.Realm}
+	}
+
+	return t, err
 }
 
-// Authenticate verifies that the authenticated request is protocol compliant and valid.
+// Authenticate verifies that the authenticated request is protocol compliant
+// and valid. The *TokenCredentials returned is nil if the request is signed
+// with only client credentials.
 func (s *Server) Authenticate(r *http.Request) (*ClientCredentials, *TokenCredentials, error) {
 	var (
 		c   *ClientCredentials
@@ -173,15 +184,12 @@ func (s *Server) Authenticate(r *http.Request) (*ClientCredentials, *TokenCreden
 		err error
 	)
 
-	rr, err := s.validate(r)
+	rr, err := s.validate(r, false)
 	if err != nil {
 		return nil, nil, err
 	}
 	c = rr.client
 	t = rr.token
-	if t != nil && t.IsTemporary() {
-		return nil, nil, unauthorized{"temporary token credentials", s.Realm}
-	}
 	return c, t, nil
 }
 
@@ -192,10 +200,11 @@ type request struct {
 
 	client *ClientCredentials
 	token  *TokenCredentials
+	temp   *TempCredentials
 }
 
 // validate checks that the request is spec compliant and authentic.
-func (s *Server) validate(r *http.Request, required ...string) (*request, error) {
+func (s *Server) validate(r *http.Request, temp bool, required ...string) (*request, error) {
 	params, err := requestParameters(r)
 	if err != nil {
 		return nil, errors.Wrap(err, "bad request parameters")
@@ -223,24 +232,25 @@ func (s *Server) validate(r *http.Request, required ...string) (*request, error)
 		}
 	}
 
-	rr.client, err = s.Store.GetClient(r.Context(), proto.clientID)
+	rr.client, err = s.getClient(r.Context(), proto.clientID)
 	if err != nil {
-		if err == ErrNotFound {
-			return rr, unauthorized{"client not found", s.Realm}
-		}
-		return rr, errors.Wrap(err, "failed to fetch client")
+		return rr, err
 	}
-	if proto.tokenID != "" {
-		rr.token, err = s.Store.GetToken(r.Context(), proto.tokenID)
-		if err != nil {
-			if err == ErrNotFound {
-				return rr, unauthorized{"token not found", s.Realm}
-			}
-			return rr, errors.Wrapf(err, "failed to fetch token %s", proto.tokenID)
-		}
-		if rr.token.ClientID != proto.clientID {
-			return rr, unauthorized{"client/token mismatch", s.Realm}
-		}
+
+	if temp {
+		rr.temp, err = s.getTemp(r.Context(), proto.tokenID)
+	} else if proto.tokenID != "" {
+		rr.token, err = s.getToken(r.Context(), proto.tokenID)
+	}
+
+	if err != nil {
+		return rr, err
+	}
+	if rr.token != nil && rr.token.ClientID != proto.clientID {
+		return rr, unauthorized{"client/token mismatch", s.Realm}
+	}
+	if rr.temp != nil && rr.temp.ClientID != proto.clientID {
+		return rr, unauthorized{"client/token mismatch", s.Realm}
 	}
 
 	if !s.skipVerifySignature {
@@ -250,7 +260,7 @@ func (s *Server) validate(r *http.Request, required ...string) (*request, error)
 	if err == nil && !s.skipVerifyNonce {
 		err = s.Store.ConsumeNonce(r.Context(), proto.nonce, proto.timestamp, proto.clientID, proto.tokenID)
 		if err == ErrNonceAlreadyUsed {
-			err = unauthorized{"nonce already used", s.Realm}
+			return rr, unauthorized{"nonce already used", s.Realm}
 		}
 		err = errors.Wrap(err, "failed to verify nonce")
 	}
@@ -265,6 +275,8 @@ func (s *Server) verifySignature(r *request) error {
 	key += "&"
 	if r.token != nil {
 		key += encode(r.token.Secret)
+	} else if r.temp != nil {
+		key += encode(r.temp.Secret)
 	}
 	mac := hmac.New(sha1.New, []byte(key))
 	_, err := mac.Write([]byte(baseString(r)))
@@ -373,7 +385,7 @@ func newProtocolParameters(p url.Values, extraReq, skipReq []string) (*protocolP
 }
 
 func baseString(r *request) []byte {
-	return []byte(fmt.Sprintf("%s&%s&%s", encode(strings.ToUpper(r.Method)), encode(baseStringURI(r.Request)), encode(normalize(r.rawProto))))
+	return []byte(encode(strings.ToUpper(r.Method)) + "&" + encode(baseStringURI(r.Request)) + "&" + encode(normalize(r.rawProto)))
 }
 
 func baseStringURI(r *http.Request) string {
@@ -467,6 +479,30 @@ func authorizationHeaderParameters(s string) (params url.Values, err error) {
 		params.Add(k, v)
 	}
 	return params, err
+}
+
+func (s *Server) getClient(ctx context.Context, id string) (*ClientCredentials, error) {
+	c, err := s.Store.GetClient(ctx, id)
+	if err == ErrNotFound {
+		return nil, unauthorized{"client credentials not found", s.Realm}
+	}
+	return c, errors.Wrapf(err, "failed to fetch client %s", id)
+}
+
+func (s *Server) getToken(ctx context.Context, id string) (*TokenCredentials, error) {
+	t, err := s.Store.GetToken(ctx, id)
+	if err == ErrNotFound {
+		return nil, unauthorized{"token credentials not found", s.Realm}
+	}
+	return t, errors.Wrapf(err, "failed to fetch token %s", id)
+}
+
+func (s *Server) getTemp(ctx context.Context, id string) (*TempCredentials, error) {
+	t, err := s.Store.GetTemp(ctx, id)
+	if err == ErrNotFound {
+		return nil, unauthorized{"temporary credentials not found", s.Realm}
+	}
+	return t, errors.Wrapf(err, "failed to fetch temporary credentials %s", id)
 }
 
 type clock time.Time

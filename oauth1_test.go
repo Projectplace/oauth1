@@ -3,7 +3,9 @@ package oauth1
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
@@ -21,7 +23,7 @@ var (
 		ID:     "dpf43f3p2l4k3l03",
 		Secret: "kd94hf93k423kf44",
 	}
-	tempToken = &TokenCredentials{
+	tempToken = &TempCredentials{
 		ID:               "hh5s93j4hdidpola",
 		Secret:           "hdhd0244k9j7ao03",
 		ClientID:         printerClient.ID,
@@ -38,7 +40,7 @@ var (
 		Secret:   "xxx",
 		ClientID: "unrelated",
 	}
-	unrelatedTempToken = &TokenCredentials{
+	unrelatedTempToken = &TempCredentials{
 		ID:               "foo",
 		Secret:           "bar",
 		ClientID:         printerClient.ID,
@@ -213,7 +215,7 @@ func TestTokenCredentials(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			r, _ := readRequest(tc.request, true)
-			tkn, err := server.TokenCredentials(r)
+			tkn, err := server.ConcludeAuthorization(r)
 
 			if tc.wantErr != nil {
 				if err == nil {
@@ -229,9 +231,6 @@ func TestTokenCredentials(t *testing.T) {
 				t.Fatalf("got unexpected error `%v`", err)
 			}
 
-			if tkn.IsTemporary() {
-				t.Error("got temporary credentials")
-			}
 			if tkn.ID == "" {
 				t.Error("ID missing from token credentials")
 			}
@@ -251,7 +250,7 @@ func TestAuthorize(t *testing.T) {
 		name       string
 		url        string
 		wantClient *ClientCredentials
-		wantToken  *TokenCredentials
+		wantToken  *TempCredentials
 		wantCode   int
 	}{
 		{
@@ -287,7 +286,7 @@ func TestAuthorize(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 
 			r := httptest.NewRequest("GET", tc.url, nil)
-			cli, tkn, err := server.Authorize(r)
+			cli, tkn, err := server.RequestAuthorization(r)
 
 			if code := errCode(err); code != tc.wantCode {
 				t.Logf("client %v; token %v", cli, tkn)
@@ -388,7 +387,7 @@ func TestTempCredentials(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			tkn, err := server.TempCredentials(r)
+			tkn, err := server.InitiateAuthorization(r)
 
 			if tc.wantErr != nil {
 				if err == nil {
@@ -404,9 +403,6 @@ func TestTempCredentials(t *testing.T) {
 				t.Fatalf("got unexpected error `%v`", err)
 			}
 
-			if !tkn.IsTemporary() {
-				t.Error("got non-temporary credentials")
-			}
 			if tkn.ID == "" {
 				t.Error("ID missing from temporary credentials")
 			}
@@ -419,22 +415,19 @@ func TestTempCredentials(t *testing.T) {
 
 func TestWriteToken(t *testing.T) {
 	testCases := []struct {
-		name        string
-		isTemporary bool
+		name string
+		cred interface {
+			WriteTo(http.ResponseWriter) error
+		}
 	}{
-		{"temp credentials", true},
-		{"token credentials", false},
+		{"temp credentials", &TempCredentials{ID: "123", Secret: "abc"}},
+		{"token credentials", &TokenCredentials{ID: "123", Secret: "abc"}},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			tkn := &TokenCredentials{ID: "123", Secret: "abc"}
-			if tc.isTemporary {
-				tkn.VerificationCode = "xyz"
-			}
-
 			w := httptest.NewRecorder()
-			WriteToken(w, tkn)
+			tc.cred.WriteTo(w)
 
 			if ct := w.HeaderMap.Get("content-type"); ct != "application/x-www-form-urlencoded" {
 				t.Errorf("bad content-type: %#v", ct)
@@ -444,17 +437,19 @@ func TestWriteToken(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if tc.isTemporary {
+			if v := values.Get("oauth_token"); v != "123" {
+				t.Errorf(`want oauth_token "123"; got %q`, v)
+			}
+			if v := values.Get("oauth_token_secret"); v != "abc" {
+				t.Errorf(`want oauth_token_secret "abc"; got %q`, v)
+			}
+
+			if _, ok := tc.cred.(*TempCredentials); ok {
 				if v := values.Get("oauth_callback_confirmed"); v != "true" {
-					t.Errorf(`want oauth_callback_confirmed="true"; got %#v`, v)
+					t.Errorf(`want oauth_callback_confirmed "true"; got %q`, v)
 				}
 			}
 
-			for _, k := range []string{"oauth_token", "oauth_token_secret"} {
-				if values.Get(k) == "" {
-					t.Errorf("missing value for %v", k)
-				}
-			}
 		})
 
 	}
@@ -465,16 +460,19 @@ func Test_validate(t *testing.T) {
 	server.skipVerifySignature = false
 
 	http, https := false, true
+	token, temp := false, true
 	verifySignature, noVerifySignature := false, true
 
 	testCases := []struct {
 		name       string
 		request    string
 		https      bool // use https instead of http
+		temp       bool
 		skipVerify bool // skip signature verification
 
 		wantClient *ClientCredentials
 		wantToken  *TokenCredentials
+		wantTemp   *TempCredentials
 		wantError  bool
 	}{
 		{
@@ -491,9 +489,11 @@ func Test_validate(t *testing.T) {
 				` oauth_signature="74KNZJeDHnMBp0EMJ9ZHt%2FXKycU%3D"` +
 				"\r\n\r\n",
 			https,
+			token,
 			verifySignature,
 
 			printerClient,
+			nil,
 			nil,
 			false,
 		},
@@ -512,9 +512,11 @@ func Test_validate(t *testing.T) {
 				` oauth_signature="gKgrFCywp7rO0OXSjdot%2FIHF7IU%3D"` +
 				"\r\n\r\n",
 			https,
+			temp,
 			verifySignature,
 
 			printerClient,
+			nil,
 			tempToken,
 			false,
 		},
@@ -532,10 +534,12 @@ func Test_validate(t *testing.T) {
 				` oauth_signature="MdpQcU8iPSUjWoN%2FUDMsK2sui9I%3D"` +
 				"\r\n\r\n",
 			http,
+			token,
 			verifySignature,
 
 			printerClient,
 			photoToken,
+			nil,
 			false,
 		},
 
@@ -554,8 +558,10 @@ func Test_validate(t *testing.T) {
 				` oauth_signature="AAAAAAAAAAAAAAAAAAAAAAAAAAA%3D"` +
 				"\r\n\r\n",
 			http,
+			token,
 			verifySignature,
 
+			nil,
 			nil,
 			nil,
 			true,
@@ -574,10 +580,12 @@ func Test_validate(t *testing.T) {
 				` oauth_signature="MdpQcU8iPSUjWoN%2FUDMsK2sui9I%3D"` +
 				"\r\n\r\n",
 			http,
+			token,
 			noVerifySignature,
 
 			printerClient,
 			photoToken,
+			nil,
 			true,
 		},
 		{
@@ -594,10 +602,12 @@ func Test_validate(t *testing.T) {
 				` oauth_signature="MdpQcU8iPSUjWoN%2FUDMsK2sui9I%3D"` +
 				"\r\n\r\n",
 			http,
+			token,
 			noVerifySignature,
 
 			printerClient,
 			photoToken,
+			nil,
 			true,
 		},
 		{
@@ -614,10 +624,12 @@ func Test_validate(t *testing.T) {
 				` oauth_signature="MdpQcU8iPSUjWoN%2FUDMsK2sui9I%3D"` +
 				"\r\n\r\n",
 			http,
+			token,
 			noVerifySignature,
 
 			printerClient,
 			unrelatedToken,
+			nil,
 			true,
 		},
 	}
@@ -629,7 +641,7 @@ func Test_validate(t *testing.T) {
 				t.Fatal(err)
 			}
 			server.skipVerifySignature = tc.skipVerify
-			r, err := server.validate(req)
+			r, err := server.validate(req, tc.temp)
 			if tc.wantError {
 				if err == nil {
 					t.Fatal("want error")
@@ -643,6 +655,9 @@ func Test_validate(t *testing.T) {
 				}
 				if !reflect.DeepEqual(r.token, tc.wantToken) {
 					t.Errorf("want %#v; got %#v", tc.wantToken, r.token)
+				}
+				if !reflect.DeepEqual(r.temp, tc.wantTemp) {
+					t.Errorf("want %#v; got %#v", tc.wantTemp, r.temp)
 				}
 			}
 		})
@@ -660,11 +675,11 @@ func Test_validate(t *testing.T) {
 					t.Fatal(err)
 				}
 				server.skipVerifySignature = tc.skipVerify
-				_, err = server.validate(req)
+				_, err = server.validate(req, tc.temp)
 				if err != nil {
 					t.Fatal("first try:", err)
 				}
-				_, err = server.validate(req)
+				_, err = server.validate(req, tc.temp)
 				if err == nil {
 					t.Fatal("want error")
 				}
@@ -1230,7 +1245,7 @@ func mustParseURL(s string) *url.URL {
 func newTestServer() *Server {
 	var server *Server
 
-	db := newSqliteDB()
+	db := new(store)
 	server = &Server{
 		Store:               db,
 		Realm:               "Photos",
@@ -1241,11 +1256,11 @@ func newTestServer() *Server {
 		time:                new(clock),
 	}
 	*(server.time) = clock(time.Unix(137131500, 0))
-	db.mustAddClient(printerClient)
-	db.mustAddToken(tempToken)
-	db.mustAddToken(photoToken)
-	db.mustAddToken(unrelatedToken)
-	db.mustAddToken(unrelatedTempToken)
+	db.addClient(printerClient)
+	db.addTemp(tempToken)
+	db.addToken(photoToken)
+	db.addToken(unrelatedToken)
+	db.addTemp(unrelatedTempToken)
 
 	return server
 }
@@ -1262,4 +1277,81 @@ func errCode(err error) int {
 		return http.StatusBadRequest
 	}
 	return http.StatusInternalServerError
+}
+
+type store struct {
+	clients map[string]*ClientCredentials
+	tokens  map[string]*TokenCredentials
+	temps   map[string]*TempCredentials
+	nonces  []string
+}
+
+func (s *store) GetClient(ctx context.Context, id string) (c *ClientCredentials, err error) {
+	c, ok := s.clients[id]
+	if !ok {
+		err = ErrNotFound
+	}
+	return c, err
+}
+
+func (s *store) GetToken(ctx context.Context, id string) (t *TokenCredentials, err error) {
+	t, ok := s.tokens[id]
+	if !ok {
+		err = ErrNotFound
+	}
+	return t, err
+}
+
+func (s *store) GetTemp(ctx context.Context, id string) (t *TempCredentials, err error) {
+	t, ok := s.temps[id]
+	if !ok {
+		err = ErrNotFound
+	}
+	return t, err
+}
+
+func (s *store) AddTempCredentials(ctx context.Context, t *TempCredentials) error {
+	if s.temps == nil {
+		s.temps = make(map[string]*TempCredentials)
+	}
+	s.temps[t.ID] = t
+	return nil
+}
+
+func (s *store) ConvertTempCredentials(ctx context.Context, old *TempCredentials, new *TokenCredentials) error {
+	delete(s.temps, old.ID)
+	if s.tokens == nil {
+		s.tokens = make(map[string]*TokenCredentials)
+	}
+	s.tokens[new.ID] = new
+	return nil
+}
+
+func (s *store) ConsumeNonce(ctx context.Context, nonce string, timestamp time.Time, clientID, tokenID string) error {
+	combo := fmt.Sprint(nonce, timestamp, clientID, tokenID)
+	for _, seen := range s.nonces {
+		if seen == combo {
+			return ErrNonceAlreadyUsed
+		}
+	}
+	s.nonces = append(s.nonces, combo)
+	return nil
+}
+
+func (s *store) addClient(c *ClientCredentials) {
+	if s.clients == nil {
+		s.clients = make(map[string]*ClientCredentials)
+	}
+	s.clients[c.ID] = c
+}
+
+func (s *store) addToken(t *TokenCredentials) {
+	if s.tokens == nil {
+		s.tokens = make(map[string]*TokenCredentials)
+	}
+	s.tokens[t.ID] = t
+}
+
+func (s *store) addTemp(t *TempCredentials) {
+	s.AddTempCredentials(context.Background(), t)
 }
